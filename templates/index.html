@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>MCX Natural Gas Strategist</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0d1117; color: #e6edf3; font-family: 'Courier New', monospace; padding: 20px; }
+    h1 { color: #58a6ff; margin-bottom: 20px; font-size: 1.4rem; }
+    #run-btn {
+      background: #238636; color: #fff; border: none;
+      padding: 10px 24px; font-size: 1rem; border-radius: 6px;
+      cursor: pointer; margin-bottom: 20px;
+    }
+    #run-btn:disabled { background: #444; cursor: not-allowed; }
+    #output {
+      white-space: pre-wrap; background: #161b22;
+      border: 1px solid #30363d; border-radius: 6px;
+      padding: 16px; min-height: 200px; line-height: 1.6;
+    }
+    #status { margin-bottom: 10px; color: #8b949e; font-size: 0.85rem; }
+  </style>
+</head>
+<body>
+  <h1>MCX Natural Gas — Morning Strategist</h1>
+  <button id="run-btn" onclick="runAnalysis()">&#9654; Run Morning Analysis</button>
+  <div id="status">Ready.</div>
+  <div id="output"></div>
+
+  <script>
+    async function runAnalysis() {
+      const btn = document.getElementById('run-btn');
+      const output = document.getElementById('output');
+      const status = document.getElementById('status');
+
+      btn.disabled = true;
+      output.textContent = '';
+      status.textContent = 'Fetching live data… this may take 30–60 seconds.';
+
+      try {
+        const res = await fetch('/api/analyze', { method: 'POST' });
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n\n');
+          buffer = lines.pop();
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const raw = line.slice(6).trim();
+              if (raw === '[DONE]') { status.textContent = 'Done.'; break; }
+              try {
+                const payload = JSON.parse(raw);
+                if (typeof payload === 'string') output.textContent += payload;
+                else if (payload.error) output.textContent += '\n[Error] ' + payload.error;
+              } catch {}
+            }
+          }
+        }
+      } catch (err) {
+        output.textContent = 'Request failed: ' + err.message;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>
