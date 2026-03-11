@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import logging
 import os
-import textwrap
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -39,8 +38,17 @@ _TELEGRAM_MAX = 4096
 
 
 def _split_message(text: str, max_len: int = _TELEGRAM_MAX) -> list[str]:
-    return textwrap.wrap(text, width=max_len, replace_whitespace=False,
-                         break_long_words=False, break_on_hyphens=False)
+    chunks, current = [], []
+    current_len = 0
+    for line in text.splitlines(keepends=True):
+        if current_len + len(line) > max_len and current:
+            chunks.append("".join(current))
+            current, current_len = [], 0
+        current.append(line)
+        current_len += len(line)
+    if current:
+        chunks.append("".join(current))
+    return chunks
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

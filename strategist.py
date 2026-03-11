@@ -1,21 +1,26 @@
 """
 MCX Natural Gas Strategist — Core analysis engine.
 
-Uses Claude Opus 4.6 with adaptive thinking + live web_search / web_fetch tools
-to autonomously pull NYMEX, USD/INR, EIA, and NOAA data, then stream a
-structured morning briefing.
+Uses ClawRouter (smart model routing) + Tavily (web search) to autonomously
+pull NYMEX, USD/INR, EIA, and NOAA data, then produce a structured morning
+briefing. ClawRouter picks the cheapest capable model automatically.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from datetime import date
 from typing import AsyncIterator
 
-import anthropic
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
+from tavily import AsyncTavilyClient
 
 load_dotenv()
+
+CLAWROUTER_URL = os.environ.get("CLAWROUTER_URL", "http://127.0.0.1:8402/v1")
+MODEL = "clawrouter/auto"
 
 SYSTEM_PROMPT = """\
 You are an expert Commodity Derivatives Strategist specialising in MCX Natural \
@@ -115,65 +120,93 @@ recent figure you can find.
 - Be concise and professional. Avoid filler sentences.
 """
 
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the web for current real-time information. "
+                "Use this to fetch NYMEX prices, USD/INR rates, EIA storage "
+                "data, NOAA weather outlooks, and geopolitical news."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    }
+]
+
+
 def _build_user_prompt() -> str:
     today = date.today().strftime("%A, %d %B %Y")
     return (
         f"Today is {today}. Run the complete MCX Natural Gas morning "
-        "pre-market analysis. Fetch all required live data (NYMEX price, "
+        "pre-market analysis. Search for all required live data (NYMEX price, "
         "USD/INR rate, EIA storage, NOAA weather outlook, geopolitical news) "
         "and produce the full structured briefing as specified in your "
         "instructions."
     )
 
-async def stream_analysis() -> AsyncIterator[str]:
-    client = anthropic.AsyncAnthropic()
 
-    tools: list[dict] = [
-        {"type": "web_search_20260209", "name": "web_search"},
-        {"type": "web_fetch_20260209",  "name": "web_fetch"},
+async def _run_web_search(query: str) -> str:
+    tavily = AsyncTavilyClient(api_key=os.environ["TAVILY_API_KEY"])
+    results = await tavily.search(
+        query=query,
+        max_results=5,
+        include_answer=True,
+    )
+    return json.dumps(results)
+
+
+async def stream_analysis() -> AsyncIterator[str]:
+    client = AsyncOpenAI(base_url=CLAWROUTER_URL, api_key="clawrouter")
+
+    messages: list[dict] = [
+        {"role": "user", "content": _build_user_prompt()}
     ]
 
-    user_prompt = _build_user_prompt()
-    messages: list[dict] = [{"role": "user", "content": user_prompt}]
-
-    max_continuations = 5
+    max_iterations = 10
 
     try:
-        for _ in range(max_continuations):
-            async with client.messages.stream(
-                model="claude-opus-4-6",
-                max_tokens=8192,
-                thinking={"type": "adaptive"},
-                system=SYSTEM_PROMPT,
-                tools=tools,
+        for _ in range(max_iterations):
+            response = await client.chat.completions.create(
+                model=MODEL,
                 messages=messages,
-            ) as stream:
-                async for event in stream:
-                    if (
-                        event.type == "content_block_delta"
-                        and event.delta.type == "text_delta"
-                    ):
-                        chunk = event.delta.text
-                        yield f"data: {json.dumps(chunk)}\n\n"
+                tools=TOOLS,
+                max_tokens=8192,
+            )
 
-                final = await stream.get_final_message()
+            choice = response.choices[0]
+            finish_reason = choice.finish_reason
+            message = choice.message
 
-            if final.stop_reason == "end_turn":
-                break
-
-            if final.stop_reason == "pause_turn":
-                messages = [
-                    {"role": "user",      "content": user_prompt},
-                    {"role": "assistant", "content": final.content},
-                ]
+            if finish_reason == "tool_calls" and message.tool_calls:
+                messages.append(message.model_dump(exclude_unset=True))
+                for tc in message.tool_calls:
+                    args = json.loads(tc.function.arguments)
+                    result = await _run_web_search(args["query"])
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": result,
+                    })
                 continue
 
+            if message.content:
+                chunk_size = 100
+                text = message.content
+                for i in range(0, len(text), chunk_size):
+                    yield f"data: {json.dumps(text[i:i + chunk_size])}\n\n"
             break
 
-    except anthropic.AuthenticationError:
-        yield 'data: {"error": "Invalid ANTHROPIC_API_KEY"}\n\n'
-    except anthropic.RateLimitError:
-        yield 'data: {"error": "Rate limited — please retry in a moment"}\n\n'
     except Exception as exc:
         yield f'data: {json.dumps({"error": str(exc)})}\n\n'
     finally:
